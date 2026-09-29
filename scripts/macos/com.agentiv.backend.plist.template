@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentiv.backend</string>
+
+    <!-- Invokes the venv's own python directly rather than "python3" on
+         PATH or a shell-sourced activate — launchd doesn't run a login
+         shell by default, so this needs to be deterministic. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO_DIR__/backend/venv/bin/python</string>
+        <string>__REPO_DIR__/run.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Don't restart-loop faster than every 10s if it's crashing hard. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_DIR__/.launchd/backend.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_DIR__/.launchd/backend.error.log</string>
+</dict>
+</plist>

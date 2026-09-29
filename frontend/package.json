@@ -1,0 +1,16 @@
+{
+  "name": "agent-iv-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --port ${FRONTEND_PORT:-4024}",
+    "build": "next build",
+    "start": "next start --port ${FRONTEND_PORT:-4024}",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "^16.2.7",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}

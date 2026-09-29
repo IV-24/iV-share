@@ -1,0 +1,446 @@
+#!/bin/bash
+# iV process control — designed for typing on a phone over SSH.
+#
+#   ivctl status | start | stop | restart | logs [-f] | health
+#   ivctl restart api        # backend only
+#   ivctl restart web        # frontend only
+#
+# "iV" is two processes: the API on 8024 and the chat frontend on 4024.
+# The page you open on a phone is the frontend, so a control script that
+# managed only the API would restart the half you cannot see and leave
+# the half you can — commands here act on both unless told otherwise.
+#
+# Two things make remote restart different from local restart, and this
+# script exists for both:
+#
+#  1. A process started from an SSH session dies when that session ends.
+#     `./run.sh` over Termius gives you an iV that lasts until you close
+#     the app. start/restart here detach the process from the terminal so
+#     it keeps running after you disconnect.
+#  2. If the macOS LaunchAgent is installed, launchd owns the process and
+#     killing it directly just makes launchd start a new one — so the
+#     right verb depends on how iV was started. This detects which and
+#     uses the matching mechanism, rather than making you remember.
+set -uo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+REPO_DIR="$(pwd)"
+
+LABEL="com.agentiv.backend"
+WEB_LABEL="com.agentiv.frontend"
+IV_PORT="${IV_PORT:-8024}"
+FRONTEND_PORT="${FRONTEND_PORT:-4024}"
+LOG_DIR="$REPO_DIR/.launchd"
+MANUAL_LOG="$LOG_DIR/manual.log"
+WEB_LOG="$LOG_DIR/frontend-manual.log"
+
+launchd_installed() {
+    command -v launchctl >/dev/null 2>&1 \
+        && [ -f "$HOME/Library/LaunchAgents/$LABEL.plist" ]
+}
+
+web_launchd_installed() {
+    command -v launchctl >/dev/null 2>&1 \
+        && [ -f "$HOME/Library/LaunchAgents/$WEB_LABEL.plist" ]
+}
+
+# Finding the server's PID is the one part of this that can do real
+# damage if it is loose. `pgrep -f run.py` matches any command line
+# containing that string — including the shell running this script, and
+# including an editor with the file open. Every candidate is therefore
+# verified against its actual command with ps: it must be a python
+# invocation whose final argument is run.py, and it must not be this
+# process or an ancestor of it.
+backend_pids() {
+    local self=$$ parent=${PPID:-0}
+    local candidates
+    candidates="$(pgrep -f "run\.py" 2>/dev/null)" || return 0
+
+    local pid command
+    for pid in $candidates; do
+        [ "$pid" = "$self" ] && continue
+        [ "$pid" = "$parent" ] && continue
+        # -ww: unlimited width. BSD ps (macOS) truncates `command=` to
+        # terminal width by default when not attached to a tty wide
+        # enough to hold it — a real install path like
+        # /Users/you/dev/agent-iv/backend/venv/bin/python plus
+        # /Users/you/dev/agent-iv/run.py easily exceeds 80 columns, so
+        # the match below silently failed and reported a live,
+        # /health-responding server as "not running". -ww is accepted by
+        # both BSD ps and GNU/procps-ng ps, so it is safe on Linux too.
+        command="$(ps -ww -o command= -p "$pid" 2>/dev/null)" || continue
+        # "<something>python[3.x] [...] run.py" and nothing after it.
+        case "$command" in
+            *python*run.py) echo "$pid" ;;
+        esac
+    done
+}
+
+# The frontend is a node process tree (npm -> next -> worker). Matching on
+# the repo's own node_modules path keeps another project's Next.js dev
+# server out of the blast radius.
+frontend_pids() {
+    local self=$$ parent=${PPID:-0}
+    local candidates
+    candidates="$(pgrep -f "next" 2>/dev/null)" || return 0
+
+    local pid command
+    for pid in $candidates; do
+        [ "$pid" = "$self" ] && continue
+        [ "$pid" = "$parent" ] && continue
+        # -ww: see the comment in backend_pids(). The frontend is even
+        # more exposed to this — $REPO_DIR/frontend has to appear
+        # somewhere in a long npm/node/next command line, and a
+        # truncated line drops exactly the part being matched.
+        command="$(ps -ww -o command= -p "$pid" 2>/dev/null)" || continue
+        case "$command" in
+            *"$REPO_DIR/frontend"*) echo "$pid" ;;
+        esac
+    done
+}
+
+is_healthy() {
+    curl -fsS -m 3 "http://127.0.0.1:${IV_PORT}/health" 2>/dev/null
+}
+
+web_responding() {
+    curl -fsS -m 4 -o /dev/null "http://127.0.0.1:${FRONTEND_PORT}/" 2>/dev/null
+}
+
+cmd_status() {
+    echo "API (port ${IV_PORT})"
+    if launchd_installed; then
+        echo "Managed by: launchd ($LABEL)"
+        launchctl list | grep "$LABEL" || echo "  (loaded but not listed — try: ivctl start)"
+    else
+        echo "Managed by: this script (no LaunchAgent installed)"
+    fi
+
+    local pids
+    pids="$(backend_pids | sort -u | tr '\n' ' ')"
+    if [ -n "${pids// /}" ]; then
+        echo "Process:    running (pid ${pids% })"
+    else
+        echo "Process:    not running"
+    fi
+
+    local health
+    if health="$(is_healthy)"; then
+        echo "Health:     $health"
+    else
+        echo "Health:     no response on port ${IV_PORT}"
+    fi
+
+    echo
+    echo "Frontend (port ${FRONTEND_PORT})"
+    if web_launchd_installed; then
+        echo "Managed by: launchd ($WEB_LABEL)"
+    else
+        echo "Managed by: this script (no LaunchAgent installed)"
+    fi
+    local web_pids
+    web_pids="$(frontend_pids | sort -u | tr '\n' ' ')"
+    if [ -n "${web_pids// /}" ]; then
+        echo "Process:    running (pid ${web_pids% })"
+    else
+        echo "Process:    not running"
+    fi
+    if web_responding; then
+        echo "Serving:    yes — this is the page you open on your phone"
+    else
+        echo "Serving:    no response on port ${FRONTEND_PORT}"
+    fi
+}
+
+cmd_stop() {
+    if launchd_installed; then
+        echo "Stopping via launchd..."
+        launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null \
+            || launchctl unload "$HOME/Library/LaunchAgents/$LABEL.plist" 2>/dev/null
+        echo "Stopped. (Use 'ivctl start' to bring it back.)"
+        return 0
+    fi
+
+    local pids
+    pids="$(backend_pids | sort -u)"
+    if [ -z "$pids" ]; then
+        echo "Not running."
+        return 0
+    fi
+
+    # SIGTERM first: the FastAPI lifespan closes the SQLite handle on the
+    # way out. SIGKILL skips that, so it is a last resort, not the default.
+    echo "Sending SIGTERM to: $(echo "$pids" | tr '\n' ' ')"
+    echo "$pids" | xargs kill -TERM 2>/dev/null
+
+    for _ in $(seq 1 15); do
+        [ -z "$(backend_pids | sort -u)" ] && { echo "Stopped cleanly."; return 0; }
+        sleep 1
+    done
+
+    echo "Still running after 15s; sending SIGKILL." >&2
+    backend_pids | sort -u | xargs kill -KILL 2>/dev/null
+    sleep 1
+    [ -z "$(backend_pids | sort -u)" ] && echo "Killed." || { echo "Could not stop it." >&2; return 1; }
+}
+
+cmd_start() {
+    if [ -n "$(backend_pids | sort -u)" ]; then
+        echo "Already running. Use 'ivctl restart'."
+        return 0
+    fi
+
+    if launchd_installed; then
+        echo "Starting via launchd..."
+        launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$LABEL.plist" 2>/dev/null \
+            || launchctl load -w "$HOME/Library/LaunchAgents/$LABEL.plist" 2>/dev/null
+    else
+        if [ ! -x "backend/venv/bin/python" ]; then
+            echo "backend/venv not found. Run ./run.sh once locally first." >&2
+            return 1
+        fi
+        mkdir -p "$LOG_DIR"
+        echo "Starting detached (survives this SSH session ending)..."
+        # setsid where available, nohup otherwise: either way the process
+        # leaves this session's process group and ignores the SIGHUP that
+        # arrives when the connection drops.
+        if command -v setsid >/dev/null 2>&1; then
+            setsid backend/venv/bin/python run.py >> "$MANUAL_LOG" 2>&1 < /dev/null &
+        else
+            nohup backend/venv/bin/python run.py >> "$MANUAL_LOG" 2>&1 < /dev/null &
+        fi
+        # Recorded so stop/restart have an exact PID rather than relying
+        # on pattern matching alone.
+        echo $! > "$LOG_DIR/iv.pid"
+        disown 2>/dev/null || true
+    fi
+
+    echo -n "Waiting for health"
+    for _ in $(seq 1 45); do
+        if is_healthy >/dev/null; then
+            echo
+            echo "Up: $(is_healthy)"
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+    echo
+    echo "Did not become healthy in 45s. Check: ivctl logs" >&2
+    return 1
+}
+
+web_stop() {
+    if web_launchd_installed; then
+        echo "Stopping frontend via launchd..."
+        launchctl bootout "gui/$(id -u)/$WEB_LABEL" 2>/dev/null \
+            || launchctl unload "$HOME/Library/LaunchAgents/$WEB_LABEL.plist" 2>/dev/null
+        return 0
+    fi
+
+    local pids
+    pids="$(frontend_pids | sort -u)"
+    if [ -z "$pids" ]; then
+        echo "Frontend not running."
+        return 0
+    fi
+    echo "Stopping frontend: $(echo "$pids" | tr '\n' ' ')"
+    echo "$pids" | xargs kill -TERM 2>/dev/null
+    for _ in $(seq 1 15); do
+        [ -z "$(frontend_pids | sort -u)" ] && { echo "Frontend stopped."; return 0; }
+        sleep 1
+    done
+    echo "Frontend still running; sending SIGKILL." >&2
+    frontend_pids | sort -u | xargs kill -KILL 2>/dev/null
+    sleep 1
+}
+
+web_start() {
+    if [ -n "$(frontend_pids | sort -u)" ]; then
+        echo "Frontend already running."
+        return 0
+    fi
+    if [ ! -d "frontend/node_modules" ]; then
+        echo "frontend/node_modules missing. Run ./run.sh once locally first." >&2
+        return 1
+    fi
+
+    if web_launchd_installed; then
+        echo "Starting frontend via launchd..."
+        launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$WEB_LABEL.plist" 2>/dev/null \
+            || launchctl load -w "$HOME/Library/LaunchAgents/$WEB_LABEL.plist" 2>/dev/null
+    else
+        mkdir -p "$LOG_DIR"
+        echo "Starting frontend detached..."
+        # Its own session, so the whole npm -> next -> worker tree leaves
+        # this SSH session's process group and survives disconnection.
+        if command -v setsid >/dev/null 2>&1; then
+            (cd frontend && setsid env IV_API_URL="http://127.0.0.1:${IV_PORT}" \
+                FRONTEND_PORT="${FRONTEND_PORT}" npm run dev >> "$WEB_LOG" 2>&1 < /dev/null &)
+        else
+            (cd frontend && nohup env IV_API_URL="http://127.0.0.1:${IV_PORT}" \
+                FRONTEND_PORT="${FRONTEND_PORT}" npm run dev >> "$WEB_LOG" 2>&1 < /dev/null &)
+        fi
+    fi
+
+    echo -n "Waiting for the frontend"
+    for _ in $(seq 1 60); do
+        web_responding && { echo; echo "Frontend up on port ${FRONTEND_PORT}."; return 0; }
+        echo -n "."
+        sleep 1
+    done
+    echo
+    echo "Frontend did not respond in ${FRONTEND_PORT:+60}s." >&2
+    # Print the log rather than telling someone to go and find it. A
+    # failure over SSH is exactly when an extra round trip costs most,
+    # and the answer is almost always in the last few lines.
+    dump_log "frontend" >&2
+    return 1
+}
+
+# Tails whichever of a component's logs exist. Used both by `ivctl logs`
+# and automatically when a start fails.
+dump_log() {
+    local which="$1" lines="${2:-25}"
+    local files=()
+    if [ "$which" != "web" ] && [ "$which" != "frontend" ]; then
+        for f in "$LOG_DIR/backend.error.log" "$LOG_DIR/backend.log" "$MANUAL_LOG"; do
+            [ -f "$f" ] && files+=("$f")
+        done
+    fi
+    if [ "$which" != "api" ] && [ "$which" != "backend" ]; then
+        for f in "$LOG_DIR/frontend.error.log" "$LOG_DIR/frontend.log" "$WEB_LOG"; do
+            [ -f "$f" ] && files+=("$f")
+        done
+    fi
+    if [ ${#files[@]} -eq 0 ]; then
+        echo "No log files yet in $LOG_DIR" >&2
+        echo "(launchd writes there only once the agent has tried to start.)" >&2
+        return 1
+    fi
+    local f
+    for f in "${files[@]}"; do
+        echo
+        echo "--- $f (last $lines lines) ---"
+        tail -n "$lines" "$f"
+    done
+}
+
+cmd_restart() {
+    if launchd_installed; then
+        # kickstart -k stops and restarts in one step, which is both
+        # faster and free of the race where launchd revives the old
+        # process between a manual stop and start.
+        echo "Restarting via launchd..."
+        launchctl kickstart -k "gui/$(id -u)/$LABEL" || {
+            echo "kickstart failed; falling back to stop + start." >&2
+            cmd_stop; cmd_start; return $?
+        }
+        echo -n "Waiting for health"
+        for _ in $(seq 1 45); do
+            is_healthy >/dev/null && { echo; echo "Up: $(is_healthy)"; return 0; }
+            echo -n "."; sleep 1
+        done
+        echo; echo "Did not become healthy in 45s. Check: ivctl logs" >&2
+        return 1
+    fi
+    cmd_stop && cmd_start
+}
+
+cmd_logs() {
+    # Accepts `ivctl logs`, `ivctl logs -f`, `ivctl logs web`,
+    # `ivctl logs web -f` — order-insensitive, because nobody remembers
+    # which comes first while typing on a phone.
+    local which="both" follow=""
+    for arg in "$@"; do
+        case "$arg" in
+            -f|--follow) follow="-f" ;;
+            api|backend) which="api" ;;
+            web|frontend) which="web" ;;
+            "") ;;
+            *) echo "unknown argument '$arg'" >&2; return 2 ;;
+        esac
+    done
+
+    if [ -z "$follow" ]; then
+        dump_log "$which" 60
+        return $?
+    fi
+
+    local files=()
+    if [ "$which" != "web" ]; then
+        for f in "$LOG_DIR/backend.error.log" "$LOG_DIR/backend.log" "$MANUAL_LOG"; do
+            [ -f "$f" ] && files+=("$f")
+        done
+    fi
+    if [ "$which" != "api" ]; then
+        for f in "$LOG_DIR/frontend.error.log" "$LOG_DIR/frontend.log" "$WEB_LOG"; do
+            [ -f "$f" ] && files+=("$f")
+        done
+    fi
+    [ ${#files[@]} -eq 0 ] && { echo "No log files yet in $LOG_DIR" >&2; return 1; }
+    tail -n 40 -f "${files[@]}"
+}
+
+# Second argument narrows the target: "api", "web", or nothing for both.
+TARGET="${2:-both}"
+if [ "${1:-status}" = "logs" ]; then
+    TARGET="both"   # `logs` parses its own arguments, below.
+else
+    case "$TARGET" in
+        api|web|both) ;;
+        *) echo "unknown target '$TARGET' (use: api, web, or omit for both)" >&2; exit 2 ;;
+    esac
+fi
+
+want_api()  { [ "$TARGET" = "both" ] || [ "$TARGET" = "api" ]; }
+want_web()  { [ "$TARGET" = "both" ] || [ "$TARGET" = "web" ]; }
+
+case "${1:-status}" in
+    status)
+        cmd_status
+        ;;
+    start)
+        rc=0
+        want_api && { cmd_start || rc=1; }
+        want_web && { echo; web_start || rc=1; }
+        exit $rc
+        ;;
+    stop)
+        # Frontend first: it proxies to the API, and stopping it first
+        # avoids a window where the page is up and every request 502s.
+        rc=0
+        want_web && { web_stop || rc=1; }
+        want_api && { cmd_stop || rc=1; }
+        exit $rc
+        ;;
+    restart)
+        rc=0
+        want_web && { web_stop || rc=1; }
+        want_api && { cmd_restart || rc=1; }
+        want_web && { echo; web_start || rc=1; }
+        exit $rc
+        ;;
+    logs)
+        shift
+        cmd_logs "$@"
+        ;;
+    health)
+        is_healthy && echo || { echo "no response on port ${IV_PORT}" >&2; exit 1; }
+        ;;
+    *)
+        cat >&2 <<'USAGE'
+usage: ivctl <command> [api|web]
+
+  status              is everything running and healthy?
+  start               start the API and the frontend
+  stop                stop both (frontend first)
+  restart             restart both
+  logs [-f]           recent log output
+  health              raw /health JSON
+
+  Add "api" or "web" to act on just one, e.g. ivctl restart web
+USAGE
+        exit 2
+        ;;
+esac

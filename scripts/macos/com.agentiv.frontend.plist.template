@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentiv.frontend</string>
+
+    <!-- The absolute path to npm is resolved by scripts/macos/install.sh
+         and substituted here, rather than relying on a login shell to
+         find it. The previous version ran `/bin/zsh -l -c "npm run dev"`,
+         and a NON-INTERACTIVE login zsh sources .zprofile and .zlogin but
+         NOT .zshrc — which is exactly where nvm, volta, and most node
+         installers put their PATH setup. The result was a frontend that
+         started fine by hand and failed silently under launchd. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__NPM_BIN__</string>
+        <string>run</string>
+        <string>dev</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__/frontend</string>
+
+    <!-- npm needs to find node, and launchd's default PATH is minimal.
+         __NODE_DIR__ is the directory npm itself lives in. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__NODE_DIR__:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>IV_API_URL</key>
+        <string>http://127.0.0.1:8024</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_DIR__/.launchd/frontend.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_DIR__/.launchd/frontend.error.log</string>
+</dict>
+</plist>

@@ -1,0 +1,26 @@
+# Version-constrained deliberately: run.sh reinstalls this file on every
+# start, so an unpinned dependency means the code actually running can
+# change between two starts of the same commit — a failure that
+# reproduces on one machine and nowhere else, and that git bisect cannot
+# find. iV's first self-audit flagged this (REL-DEPS-01).
+#
+# ~= allows patch releases (security fixes) while holding the minor
+# version steady. These are the versions the suite passes against; raise
+# them deliberately, with a test run, rather than by accident.
+fastapi~=0.141.0
+uvicorn~=0.52.0
+python-dotenv~=1.2.0
+python-multipart~=0.0.32
+pydantic~=2.13.0
+
+# Provider SDKs. Each is imported lazily (see adapters/models/__init__.py)
+# so a missing one only affects that provider, not startup.
+google-genai~=2.18.0
+openai~=3.3.0
+anthropic~=0.122.0
+
+# Chess rules engine (adapters/games/chess_engine.py is the only module
+# allowed to import it). Move legality, check/checkmate/stalemate/draw
+# detection is delegated entirely to this library rather than trusted
+# from a model -- see that module's own docstring.
+chess~=1.11.0
